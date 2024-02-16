@@ -1,5 +1,8 @@
+#![allow(unused)]
+
 pub mod spatial_hash;
 
+use fxhash::FxHashSet;
 use spatial_hash::*;
 use std::time::Duration;
 
@@ -10,6 +13,10 @@ use rand::{Rng, SeedableRng};
 
 const WARMUP_ITERS: usize = 0;
 const MEASURE_ITERS: usize = 700;
+
+// fn count_bits(hibi: &BitSet) -> usize {
+//  hibi.layer1()
+// }
 
 fn main() {
     let mut spatial = SpatialHash::new();
@@ -76,6 +83,8 @@ fn main() {
         }
 
         let elapsed_add = time.elapsed();
+        // let mut out_vec = BitSet::default();
+        let mut out_vec = FxHashSet::default();
 
         let mut count = 0;
         for _ in 0..2000 {
@@ -90,17 +99,16 @@ fn main() {
                 mk_aabb(pos)
             };
 
-            let result = spatial.query(SpatialQuery::ShapeQuery(shape));
-            count += result.count();
+            spatial.query(SpatialQuery::ShapeQuery(shape), &mut out_vec);
+            count += out_vec.len();
+            // for _i in std::hint::black_box(out_vec.iter()) {
+            //     count += 1;
+            // }
         }
 
         iterations += 1usize;
         if iterations >= WARMUP_ITERS {
             let elapsed_query = time.elapsed();
-            //
-            // avg_add += elapsed_add.as_micros() as f64;
-            // avg_query += elapsed_query.as_micros() as f64;
-            // avg_total += time.elapsed().as_micros() as f64;
 
             min_add = min_add
                 .map(|x| Duration::min(x, elapsed_add))
@@ -138,13 +146,14 @@ fn main() {
 
             if iterations >= MEASURE_ITERS {
                 // Check deterministic results, to avoid buge
-                assert_eq!(
-                    count,
-                    expected_results[iterations - MEASURE_ITERS],
-                    "BLIN! iz buge (or other RNG)"
-                );
-
-                // println!("Results:   C: {count}");
+                if count != expected_results[iterations - MEASURE_ITERS] {
+                    eprintln!(
+                        "\n!! ERROR: results mismatch (actual {}, expected {})\n",
+                        count,
+                        expected_results[iterations - MEASURE_ITERS]
+                    );
+                    std::process::exit(1);
+                }
             }
         }
 
