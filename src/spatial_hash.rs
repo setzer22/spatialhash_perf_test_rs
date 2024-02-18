@@ -7,21 +7,6 @@ pub struct AabbShape {
     pub max: Vec2,
 }
 
-impl AabbShape {
-    pub fn intersects_circle(&self, circle: CircleShape) -> bool {
-        let closest = self.min.max(self.max.min(circle.center));
-        let distance = circle.center.distance(closest);
-        distance <= circle.radius
-    }
-
-    pub fn intersects_aabb(&self, aabb: AabbShape) -> bool {
-        self.min.x <= aabb.max.x
-            && self.max.x >= aabb.min.x
-            && self.min.y <= aabb.max.y
-            && self.max.y >= aabb.min.y
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct CircleShape {
     pub center: Vec2,
@@ -30,18 +15,10 @@ pub struct CircleShape {
 
 impl CircleShape {
     pub fn bounding_rect(&self) -> AabbShape {
-        let min = self.center - Vec2::splat(self.radius);
-        let max = self.center + Vec2::splat(self.radius);
+        let rr = Vec2::splat(self.radius);
+        let min = self.center - rr;
+        let max = self.center + rr;
         AabbShape { min, max }
-    }
-
-    pub fn intersects_circle(&self, circle: CircleShape) -> bool {
-        let distance = self.center.distance(circle.center);
-        distance <= self.radius + circle.radius
-    }
-
-    pub fn intersects_aabb(&self, aabb: AabbShape) -> bool {
-        aabb.intersects_circle(*self)
     }
 }
 
@@ -59,14 +36,40 @@ impl Shape {
         }
     }
 
-    pub fn intersects_shape(&self, shape: Shape) -> bool {
-        match (*self, shape) {
-            (Shape::Circle(circle1), Shape::Circle(circle2)) => circle1.intersects_circle(circle2),
-            (Shape::Circle(circle), Shape::Aabb(aabb))
-            | (Shape::Aabb(aabb), Shape::Circle(circle)) => circle.intersects_aabb(aabb),
-            (Shape::Aabb(aabb1), Shape::Aabb(aabb2)) => aabb1.intersects_aabb(aabb2),
+    pub fn as_circle(&self) -> &CircleShape {
+        match self {
+            Shape::Circle(circle) => circle,
+            _ => unsafe { std::hint::unreachable_unchecked() },
         }
     }
+
+    pub fn as_aabb(&self) -> &AabbShape {
+        match self {
+            Shape::Aabb(aabb) => aabb,
+            _ => unsafe { std::hint::unreachable_unchecked() },
+        }
+    }
+}
+
+pub fn intersect_aabb_circle(aabb: &AabbShape, circle: &CircleShape) -> bool {
+    let closest = Vec2::max(aabb.min, Vec2::min(aabb.max, circle.center));
+
+    let dist_sq = circle.center.distance_squared(closest);
+    dist_sq <= circle.radius * circle.radius
+}
+
+pub fn intersect_aabb_aabb(a_left: &AabbShape, a_right: &AabbShape) -> bool {
+    // a_left.min.x <= a_right.max.x
+    //     && a_left.min.y <= a_right.max.y
+    //     && a_left.max.x >= a_right.min.x
+    //     && a_left.max.y >= a_right.min.y
+
+    a_left.min.cmple(a_right.max).all() && a_left.max.cmpge(a_right.min).all()
+}
+pub fn intersect_circle_circle(c_left: &CircleShape, c_right: &CircleShape) -> bool {
+    let distance = c_left.center.distance_squared(c_right.center);
+    let both = c_left.radius + c_right.radius;
+    distance <= both * both
 }
 
 #[derive(Clone, Copy)]
@@ -74,10 +77,26 @@ pub enum SpatialQuery {
     ShapeQuery(Shape),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct SpatialUserData {
     pub entity_type: u32,
     pub entity_id: u32,
+}
+
+impl SpatialUserData {
+    pub fn linearize(&self) -> u32 {
+        // Use entity-type as top-most bit
+        (self.entity_type << 16) | self.entity_id
+    }
+
+    pub fn from_linearized(linearized: u32) -> Self {
+        let entity_type = linearized >> 16;
+        let entity_id = linearized & 0xFFFF;
+        Self {
+            entity_type,
+            entity_id,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -86,9 +105,15 @@ pub struct SpatialHashData {
     pub userdata: SpatialUserData,
 }
 
+#[derive(Default)]
+pub struct Cell {
+    pub circles: Vec<SpatialHashData>,
+    pub aabbs: Vec<SpatialHashData>,
+}
+
 pub struct SpatialHash {
     grid_size: f32,
-    inner: FxHashMap<(i32, i32), Vec<SpatialHashData>>,
+    inner: FxHashMap<(i32, i32), Cell>,
 }
 
 impl SpatialHash {
@@ -117,8 +142,14 @@ impl SpatialHash {
         for x in min.x as i32..max.x as i32 {
             for y in min.y as i32..max.y as i32 {
                 let key = (x, y);
-                let entry = self.inner.entry(key).or_insert_with(Vec::new);
-                entry.push(SpatialHashData {
+                let cell = self.inner.entry(key).or_insert_with(Cell::default);
+
+                let vec = match shape {
+                    Shape::Circle(_) => &mut cell.circles,
+                    Shape::Aabb(_) => &mut cell.aabbs,
+                };
+
+                vec.push(SpatialHashData {
                     shape,
                     userdata: data,
                 });
@@ -126,7 +157,15 @@ impl SpatialHash {
         }
     }
 
-    pub fn query(&self, query: SpatialQuery) -> impl Iterator<Item = &SpatialUserData> {
+    pub fn query<'a, 'b: 'a>(
+        &'b self,
+        query: SpatialQuery,
+        // out_vec: &mut FxHashSet<&'a SpatialUserData>,
+        out_vec: &mut FxHashSet<u32>,
+        // out_vec: &mut BitSet
+    )
+    /*-> impl Iterator<Item = &SpatialUserData>*/
+    {
         match query {
             SpatialQuery::ShapeQuery(shape) => {
                 let bounding_rect = shape.bounding_rect();
@@ -134,13 +173,50 @@ impl SpatialHash {
                 let max = bounding_rect.max / self.grid_size;
                 let min = min.floor();
                 let max = max.ceil();
-                (min.x as i32..max.x as i32)
-                    .flat_map(move |x| (min.y as i32..max.y as i32).map(move |y| (x, y)))
-                    .flat_map(move |key| self.inner.get(&key).into_iter().flatten())
-                    .filter(move |data| data.shape.intersects_shape(shape))
-                    .map(|data| &data.userdata)
-                    .collect::<FxHashSet<_>>()
-                    .into_iter()
+
+                out_vec.clear();
+                // Loop over the range of x values.
+                for x in min.x as i32..max.x as i32 {
+                    // Nested loop over the range of y values.
+                    for y in min.y as i32..max.y as i32 {
+                        let key = (x, y); // Create a key from the current x and y values.
+
+                        // Attempt to retrieve the value associated with the current key from `self.inner`.
+                        if let Some(cell) = self.inner.get(&key) {
+                            // If data exists for the key, iterate over the elements.
+                            for data in cell.aabbs.iter() {
+                                match shape {
+                                    Shape::Circle(circle) => {
+                                        if intersect_aabb_circle(data.shape.as_aabb(), &circle) {
+                                            out_vec.insert(data.userdata.linearize());
+                                        }
+                                    }
+                                    Shape::Aabb(aabb) => {
+                                        if intersect_aabb_aabb(data.shape.as_aabb(), &aabb) {
+                                            out_vec.insert(data.userdata.linearize());
+                                        }
+                                    }
+                                }
+                            }
+
+                            for data in cell.circles.iter() {
+                                match shape {
+                                    Shape::Circle(circle) => {
+                                        if intersect_circle_circle(data.shape.as_circle(), &circle)
+                                        {
+                                            out_vec.insert(data.userdata.linearize());
+                                        }
+                                    }
+                                    Shape::Aabb(aabb) => {
+                                        if intersect_aabb_circle(&aabb, data.shape.as_circle()) {
+                                            out_vec.insert(data.userdata.linearize());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
